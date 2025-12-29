@@ -1,0 +1,20 @@
+[project]
+name = "fastapiproject"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "dotenv>=0.9.9",
+    "fastapi>=0.124.4",
+    "jieba>=0.42.1",
+    "numpy>=2.4.0",
+    "pydantic>=2.12.5",
+    "python-multipart>=0.0.21",
+    "redis>=7.1.0",
+    "scikit-learn>=1.8.0",
+    "snowflake-id>=1.0.2",
+    "sqlalchemy>=2.0.45",
+    "uvicorn>=0.38.0",
+    "websockets>=15.0.1",
+]
