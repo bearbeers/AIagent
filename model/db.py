@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import Union
+from typing import Union, List
 
 from pydantic import BaseModel
-from sqlalchemy import Column, String, Integer, DateTime, Float
+from sqlalchemy import Column, String, Integer, DateTime, Float, ForeignKey
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -31,7 +31,8 @@ class WorkOrderNumberTable(Base):
     work_content = Column(String)
     work_status = Column(String)
     work_form_score = Column(Float)
-    # 移除关系定义，改为在查询时手动关联（通过 report_id == work_order_number）
+    user_phone = Column(String, ForeignKey("user_info.user_phone"))
+
 
 
 class WorkOrderNumber(BaseModel):
@@ -50,6 +51,7 @@ class WorkOrderNumber(BaseModel):
     work_content: str
     work_status: str = '未处理'
     work_form_score: float = 0.0
+    user_phone: str = None
 
     class ConfigDict:
         from_attributes = True
@@ -60,10 +62,9 @@ class UserReportTable(Base):
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_id = Column(String, nullable= True)
-    report_id = Column(String, nullable= True)  # 关联到 WorkOrderNumberTable.work_order_number
+    report_id = Column(String, ForeignKey("work_order_number.work_order_number"))
     report_content = Column(String, nullable= True)
     report_time = Column(String, nullable= True)
-    # 移除关系定义，改为在查询时手动关联（通过 report_id == work_order_number）
     report_type = Column(String, nullable= True)
     report_status = Column(String, nullable= True)
 
@@ -85,7 +86,7 @@ class UserInfoTable(Base):
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_name = Column(String)
-    user_phone = Column(String)
+    user_phone = Column(String, unique=True, default='18282523984')
 
 class UserInfo(BaseModel):
     user_name: str
@@ -93,6 +94,54 @@ class UserInfo(BaseModel):
 
     class ConfigDict:
         from_attributes = True
+
+
+class ProcessTable(Base):
+    __tablename__ = "process"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    work_form_id = Column(String, ForeignKey("work_order_number.work_order_number"))
+    processing_content = Column(String)
+    processing_result = Column(String)
+    public_visit = Column(String)
+
+
+class Process(BaseModel):
+    work_form_id: str
+    processing_content: str
+    processing_result: str
+    public_visit: str
+
+    class ConfigDict:
+        from_attributes = True
+
+
+class WorkPlanTable(Base):
+    __tablename__ = "work_plan"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    work_form_id = Column(String, ForeignKey("work_order_number.work_order_number"))
+    work_plan_content = Column(String)
+
+class WorkPlan(BaseModel):
+    work_form_id: str
+    work_plan_content: str
+
+    class ConfigDict:
+        from_attributes = True
+
+
+class ScoreTable(Base):
+    __tablename__ = "score"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    work_form_id = Column(String, ForeignKey("work_order_number.work_order_number"))
+    score_content = Column(String)
+
+class Score(BaseModel):
+    work_form_id: str
+    score_content: str
+
+    class ConfigDict:
+        from_attributes = True
+
 
 
 def get_db():
