@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="892a2922-c6b3-481b-b080-f7ec3550178c" name="myserver">
+        <fileTransfer rootFolder="/home/ubuntu/FastAPIProject" accessType="SFTP" host="124.221.23.109" port="22" sshConfigId="ef9dd557-2af9-45a4-afb9-d0b37e73ebf4" sshConfig="ubuntu@124.221.23.109:22 key" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" isUseSudo="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
