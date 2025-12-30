@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import json
 import uuid
 import os
@@ -15,8 +15,9 @@ from utils.json_handle import get_json_string
 from utils.request_pa import request_pa
 from utils.save_pa_token import PaTokenManager
 from utils.hot_spot import MunicipalHotspotRanker
+from dotenv import load_dotenv
 
-
+load_dotenv()
 app = APIRouter()
 websocket_connections = set()
 hotspot_ranker = MunicipalHotspotRanker()
@@ -99,7 +100,7 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
     user_report = UserReport(
         report_id=ticket_info_entry.work_order_number,
         report_content=user_content,  # 保存原始用户输入，用于匹配
-        report_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        report_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         report_status="未处理"
     )
     user_report_entry = UserReportTable(
@@ -124,7 +125,7 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
             "type": "new_issue",
             "title": "新问题反馈",
             "content": user_content,
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "status": "pending",
             "report_idx": report_idx
         }
@@ -326,7 +327,7 @@ async def get_work_order_by_issue(issue: str, db: Session = Depends(get_db)):
                 "work_status": work_order.work_status,
                 "report_time": work_order.report_time.strftime("%Y-%m-%d %H:%M:%S") if work_order.report_time else None,
             }
-
+        pa_token_manager.work_form_number = work_order.work_order_number
         return JSONResponse({"error": "未找到对应的工单信息"}, status_code=404)
     except Exception as e:
         print(f"Error in get_work_order_by_issue: {e}")
@@ -495,6 +496,18 @@ async def audio_to_text(audio_file: bytes = File(...)):
     :param audio_file: 语音文件
     :return: 语音文本内容
     """
+    # 检查环境变量是否已设置
+    if not BASE_URL:
+        return JSONResponse(
+            {"error": "服务器配置错误: DIFY_BASE_URL 环境变量未设置"},
+            status_code=500
+        )
+    if not API_KEY:
+        return JSONResponse(
+            {"error": "服务器配置错误: DIFY_API_KEY 环境变量未设置"},
+            status_code=500
+        )
+    
     try:
         url = "/audio-to-text"
         async with ClientSession() as session:
@@ -532,7 +545,7 @@ async def audio_to_text(audio_file: bytes = File(...)):
 
 
 @app.post("/gen-form/")
-async def gen_form(user_content: str = Form(None)) -> dict:
+async def gen_form(user_content: str = Form(None), db: Session = Depends(get_db)) -> dict:
     """
     调用PA agent,生成工单
     :return:
@@ -567,7 +580,7 @@ async def gen_form(user_content: str = Form(None)) -> dict:
     except Exception as e:
         print(f"Error parsing AI reply: {e}")
         work_order_data = {
-            "reportTime": datetime.datetime.now().isoformat(),
+            "reportTime": datetime.now().isoformat(),
             "ticketNumber": "解析失败",
             "severityLevel": "未知",
             "ticketType": "未知",
@@ -588,7 +601,7 @@ async def gen_form(user_content: str = Form(None)) -> dict:
         "ticket_number": work_order_data.get("ticketNumber", "未知编号"),
         "department": work_order_data.get("responsibleUnit", "未知部门"),
         "content": work_order_data.get("summary", user_content),
-        "timestamp": work_order_data.get("reportTime", datetime.datetime.now().isoformat()),
+        "timestamp": work_order_data.get("reportTime", datetime.now().isoformat()),
         "severity_level": work_order_data.get("severityLevel", "未知"),
         "ticket_type": work_order_data.get("ticketType", "未知"),
         "location": work_order_data.get("location", "未知位置"),
@@ -597,31 +610,64 @@ async def gen_form(user_content: str = Form(None)) -> dict:
     await broadcast_notification(work_order_notification)
 
     # 保存工单信息到数据库
-
-    user_report = UserReport(
-        user_id='',
-        report_id=work_order_data.get("ticketNumber", "未知编号"),
-        report_content=work_order_data.get("summary", user_content),
-        report_time=work_order_data.get("reportTime", datetime.datetime.now().isoformat()),
-        report_type="工单"
-    )
-    db_session = next(get_db())
     try:
+        # 获取报告时间
+        report_time_str = work_order_data.get("reportTime", datetime.now().isoformat())
+        try:
+            # 尝试解析 ISO 格式的时间字符串
+            report_time = datetime.fromisoformat(report_time_str.replace('Z', '+00:00'))
+        except:
+            # 如果解析失败，使用当前时间
+            report_time = datetime.now()
+
+        user_report = UserReport(
+            user_id='',
+            report_id=work_order_data.get("ticketNumber", "未知编号"),
+            report_content=work_order_data.get("summary", user_content),
+            report_time=report_time_str,
+            report_type="工单"
+        )
+
         user_report_entry = UserReportTable(
             user_id=user_report.user_id,
             report_id=user_report.report_id,
             report_content=user_report.report_content,
             report_time=user_report.report_time,
-            # report_status=user_report.report_status,
             report_type=user_report.report_type
         )
-        # db_session.add(work_order_entry)
-        db_session.add(user_report_entry)
-        db_session.commit()
-        # db_session.refresh(work_order_entry)
-        db_session.refresh(user_report_entry)
-    finally:
-        db_session.close()
+        
+        # 直接创建 WorkOrderNumberTable 对象，使用 datetime 对象而不是字符串
+        work_order_entry = WorkOrderNumberTable(
+            report_time=report_time,  # 使用 datetime 对象
+            work_order_number=work_order_data.get("ticketNumber", "未知编号"),
+            severityLevel=work_order_data.get("severityLevel", "未知"),
+            ticketType=work_order_data.get("ticketType", "未知"),
+            ticketCategory=work_order_data.get("ticketCategory", "未知"),
+            collaborationType=work_order_data.get("collaborationType", "未知"),
+            responsibleUnit=work_order_data.get("responsibleUnit", "未知部门"),
+            assistingUnit=''.join(work_order_data.get("assistingUnit", [])),
+            location=work_order_data.get("location", "未知位置"),
+            channel=work_order_data.get("channel", "手机"),
+            contact=work_order_data.get("contact", "需补充联系人信息"),
+            impactRange=work_order_data.get("impactRange", "影响范围未知"),
+            work_content=work_order_data.get("summary", user_content),
+            work_status="未处理",
+            work_form_score=0.0,
+        )
+        
+        db.add(user_report_entry)
+        db.add(work_order_entry)
+        db.commit()
+        db.refresh(user_report_entry)
+        db.refresh(work_order_entry)
+        
+        print(f"工单已保存到数据库: {work_order_entry.work_order_number}")
+    except Exception as e:
+        db.rollback()
+        print(f"保存工单到数据库时出错: {e}")
+        import traceback
+        traceback.print_exc()
+        # 即使保存失败，也返回生成的工单数据
 
     return {'ai_reply': work_order_data}
 
@@ -659,7 +705,7 @@ async def get_holiday():
     }
     params = {
         "key": os.getenv("HOLIDAY_API_KEY"),
-        "date": datetime.datetime.now().strftime("%Y-%m-%d"),
+        "date": datetime.now().strftime("%Y-%m-%d"),
     }
     async with ClientSession() as session:
         async with session.get(url, params=params, headers=headers) as resp:
@@ -677,6 +723,7 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
     :param work_order_content: 工单内容（可选，如果不提供则使用pa_token_manager.user_question）
     :return: ai回复
     """
+    print("ddddd",work_order_number)
     try:
         # 优先使用传入的工单内容，否则使用pa_token_manager中的user_question
         user_content = work_order_content or pa_token_manager.user_question or ""
@@ -685,7 +732,7 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
             return JSONResponse({"error": "工单内容不能为空"}, status_code=400)
         db_session = next(get_db())
         work_order_entry = (db_session.query(WorkOrderNumberTable)
-                            .filter(WorkOrderNumberTable.work_content == pa_token_manager.user_question)
+                            .filter(WorkOrderNumberTable.work_order_number == work_order_number)
                             .all())
         if work_order_entry:
             for entry in work_order_entry:
@@ -709,12 +756,14 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
         res_json = request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
         ai_reply = res_json['choices'][0]['message']['content']
         ai_reply_json = get_json_string(ai_reply)
-        save_solution = db_session.query(WorkPlanTable).filter(
-            WorkPlanTable.work_form_id == work_order_number
-        ).first()
-        if save_solution:
-            save_solution.work_plan_content = ai_reply
-            db_session.commit()
+        solution_data = WorkPlanTable(
+            work_form_id=work_order_number,
+            work_plan_content=ai_reply
+        )
+        db_session.add(
+            solution_data
+        )
+        db_session.commit()
         return ai_reply_json
 
     except Exception as e:
@@ -754,6 +803,7 @@ async def get_judge(process_result:str, process_content:str,public_visit:str, wo
     score_work = json_string.get("WorkOrderRating")
 
     if work_order_number:
+        print("sssss",work_order_number)
         # 获取数据库会话并更新工单状态
         db_session = next(get_db())
 
