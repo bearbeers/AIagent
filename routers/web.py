@@ -723,7 +723,6 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
     :param work_order_content: 工单内容（可选，如果不提供则使用pa_token_manager.user_question）
     :return: ai回复
     """
-    print("ddddd",work_order_number)
     try:
         # 优先使用传入的工单内容，否则使用pa_token_manager中的user_question
         user_content = work_order_content or pa_token_manager.user_question or ""
@@ -803,35 +802,36 @@ async def get_judge(process_result:str, process_content:str,public_visit:str, wo
     score_work = json_string.get("WorkOrderRating")
 
     if work_order_number:
-        print("sssss",work_order_number)
+
         # 获取数据库会话并更新工单状态
         db_session = next(get_db())
-
+        process_info = ProcessTable(
+            work_form_id=work_order_number,
+            processing_result=process_result,
+            processing_content=process_content,
+            public_visit=public_visit
+        )
+        score_info = ScoreTable(
+            work_form_id=work_order_number,
+            score_content=ai_reply
+        )
+        db_session.add(
+            process_info
+        )
+        db_session.add(
+            score_info
+        )
+        db_session.commit()
         try:
             # 查询工单记录
             work_order_entry = db_session.query(WorkOrderNumberTable).filter(
                 WorkOrderNumberTable.work_order_number == work_order_number
             ).all()
-            process_info = db_session.query(ProcessTable).filter(
-                ProcessTable.work_form_id == work_order_number
-            ).all()
-            save_score = db_session.query(ScoreTable).filter(
-                ScoreTable.work_form_id == work_order_number
-            ).first()
-            if save_score:
-                save_score.score_content = json_string
-                db_session.commit()
             for entry in work_order_entry:
                 if entry:
                     # 更新工单状态为"已处理"
                     entry.work_status = "已处理"
                     entry.work_form_score = score_work['OverallScore']
-                    db_session.commit()
-            for entry in process_info:
-                if entry:
-                    entry.processing_result = process_result
-                    entry.processing_content = process_content
-                    entry.public_visit = public_visit
                     db_session.commit()
         finally:
             db_session.close()
@@ -1083,13 +1083,12 @@ async def get_work_order_detail(
         return {
             "work_order_info": work_order_info,
             "process_info": process_info,
-            "solution_info": solution_info,
-            "score_info": score_info
+            "solution_info": get_json_string(solution_info.work_plan_content),
+            "score_info": get_json_string(score_info.score_content)
         }
     except Exception as e:
         print(f"Error in get_work_order_detail: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
