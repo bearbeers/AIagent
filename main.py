@@ -12,7 +12,7 @@ from model.db import Base, get_db, Engine
 from utils.hot_spot import MunicipalHotspotRanker
 from utils.save_pa_token import PaTokenManager
 from routers import mobile, web
-
+from fastapi.responses import HTMLResponse
 
 pa_token_manager = PaTokenManager()
 Base.metadata.create_all(Engine)
@@ -35,8 +35,9 @@ async def lifespan(application: FastAPI):
         redis_client = redis.from_url(REDIS_URL)
 
         # 获取初始token
-        await pa_token_manager.refresh_token()
+        a = await pa_token_manager.refresh_token()
         print("Initial token fetched successfully")
+        print(a)
 
         # 初始化热度分析器并从数据库加载数据
         hotspot_ranker = MunicipalHotspotRanker(similarity_threshold=0.6)
@@ -78,7 +79,12 @@ app.include_router(web.app)
 
 @app.get("/")
 async def root():
-    return {"message": "Hello Bigger Applications!"}
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'index.html')
+    html_content = ''
+    with open(html_path) as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content, status_code=200)
+
 
 if __name__ == '__main__':
     import os

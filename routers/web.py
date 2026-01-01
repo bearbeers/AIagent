@@ -2,7 +2,9 @@ from datetime import datetime
 import json
 import uuid
 import os
+from typing import Any, Dict
 from aiohttp.client import ClientSession
+from aiohttp import ClientTimeout
 from aiohttp.formdata import FormData
 from fastapi import APIRouter, File, Form, WebSocket, Depends
 from fastapi.responses import JSONResponse
@@ -71,9 +73,12 @@ async def broadcast_notification(message: dict):
 async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
     """
     接收手机端提交的问题并广播通知，同时进行热度分析
+    :param user_content: 用户提交的问题内容
+    :param db: 数据库会话（由依赖注入提供）
     """
-    ticket_info = await gen_form(user_content)
+    ticket_info = await gen_form(user_content, db)
     ticket_info = ticket_info.get("ai_reply")
+    print(ticket_info)
     ticket_info_data = WorkOrderNumber(
         work_order_number=ticket_info.get("ticketNumber", ""),
         severityLevel=ticket_info.get("severityLevel"),
@@ -120,7 +125,7 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
         report_idx = hotspot_ranker.add_report(user_content)
 
         # 创建通知消息
-        notification = {
+        notification: Dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "type": "new_issue",
             "title": "新问题反馈",
@@ -162,6 +167,7 @@ async def get_dispatch_work_orders(
 ):
     """
     获取待处置调度工单列表（从WorkOrderNumberTable表获取）
+    :param db: 数据库会话（由依赖注入提供）
     :param limit: 返回工单数量限制，默认50条
     :param status: 工单状态筛选，None表示获取所有工单
     :return: 待处置调度工单列表
@@ -257,7 +263,7 @@ async def get_dispatch_work_orders(
 async def get_work_order_by_issue(issue: str, db: Session = Depends(get_db)):
     """
     根据问题内容从WorkOrderNumberTable获取完整的工单信息
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :param issue: 问题内容（issue text）
     :return: 完整的工单信息
     """
@@ -544,11 +550,12 @@ async def audio_to_text(audio_file: bytes = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/gen-form/")
-async def gen_form(user_content: str = Form(None), db: Session = Depends(get_db)) -> dict:
+async def gen_form(user_content: str = None, db: Session = None) -> dict:
     """
-    调用PA agent,生成工单
-    :return:
+    调用PA agent,生成工单（内部函数）
+    :param user_content: 用户提交的问题内容（可选，若为空则从 pa_token_manager 获取）
+    :param db: 数据库会话（可选，如果提供则保存到数据库）
+    :return: 生成的工单数据
     """
     if user_content is None:
         user_content = pa_token_manager.user_question
@@ -596,7 +603,7 @@ async def gen_form(user_content: str = Form(None), db: Session = Depends(get_db)
         }
 
     # 广播工单生成消息到所有WebSocket客户端
-    work_order_notification = {
+    work_order_notification: Dict[str, Any] = {
         "type": "work_order_created",
         "ticket_number": work_order_data.get("ticketNumber", "未知编号"),
         "department": work_order_data.get("responsibleUnit", "未知部门"),
@@ -609,67 +616,79 @@ async def gen_form(user_content: str = Form(None), db: Session = Depends(get_db)
     }
     await broadcast_notification(work_order_notification)
 
-    # 保存工单信息到数据库
-    try:
-        # 获取报告时间
-        report_time_str = work_order_data.get("reportTime", datetime.now().isoformat())
+    # 保存工单信息到数据库（如果提供了 db 参数）
+    if db is not None:
         try:
-            # 尝试解析 ISO 格式的时间字符串
-            report_time = datetime.fromisoformat(report_time_str.replace('Z', '+00:00'))
-        except:
-            # 如果解析失败，使用当前时间
-            report_time = datetime.now()
+            # 获取报告时间
+            report_time_str = work_order_data.get("reportTime", datetime.now().isoformat())
+            try:
+                # 尝试解析 ISO 格式的时间字符串
+                report_time = datetime.fromisoformat(report_time_str.replace('Z', '+00:00'))
+            except:
+                # 如果解析失败，使用当前时间
+                report_time = datetime.now()
 
-        user_report = UserReport(
-            user_id='',
-            report_id=work_order_data.get("ticketNumber", "未知编号"),
-            report_content=work_order_data.get("summary", user_content),
-            report_time=report_time_str,
-            report_type="工单"
-        )
+            user_report = UserReport(
+                user_id='',
+                report_id=work_order_data.get("ticketNumber", "未知编号"),
+                report_content=work_order_data.get("summary", user_content),
+                report_time=report_time_str,
+                report_type="工单"
+            )
 
-        user_report_entry = UserReportTable(
-            user_id=user_report.user_id,
-            report_id=user_report.report_id,
-            report_content=user_report.report_content,
-            report_time=user_report.report_time,
-            report_type=user_report.report_type
-        )
-        
-        # 直接创建 WorkOrderNumberTable 对象，使用 datetime 对象而不是字符串
-        work_order_entry = WorkOrderNumberTable(
-            report_time=report_time,  # 使用 datetime 对象
-            work_order_number=work_order_data.get("ticketNumber", "未知编号"),
-            severityLevel=work_order_data.get("severityLevel", "未知"),
-            ticketType=work_order_data.get("ticketType", "未知"),
-            ticketCategory=work_order_data.get("ticketCategory", "未知"),
-            collaborationType=work_order_data.get("collaborationType", "未知"),
-            responsibleUnit=work_order_data.get("responsibleUnit", "未知部门"),
-            assistingUnit=''.join(work_order_data.get("assistingUnit", [])),
-            location=work_order_data.get("location", "未知位置"),
-            channel=work_order_data.get("channel", "手机"),
-            contact=work_order_data.get("contact", "需补充联系人信息"),
-            impactRange=work_order_data.get("impactRange", "影响范围未知"),
-            work_content=work_order_data.get("summary", user_content),
-            work_status="未处理",
-            work_form_score=0.0,
-        )
-        
-        db.add(user_report_entry)
-        db.add(work_order_entry)
-        db.commit()
-        db.refresh(user_report_entry)
-        db.refresh(work_order_entry)
-        
-        print(f"工单已保存到数据库: {work_order_entry.work_order_number}")
-    except Exception as e:
-        db.rollback()
-        print(f"保存工单到数据库时出错: {e}")
-        import traceback
-        traceback.print_exc()
-        # 即使保存失败，也返回生成的工单数据
+            user_report_entry = UserReportTable(
+                user_id=user_report.user_id,
+                report_id=user_report.report_id,
+                report_content=user_report.report_content,
+                report_time=user_report.report_time,
+                report_type=user_report.report_type
+            )
+            
+            # 直接创建 WorkOrderNumberTable 对象，使用 datetime 对象而不是字符串
+            work_order_entry = WorkOrderNumberTable(
+                report_time=report_time,  # 使用 datetime 对象
+                work_order_number=work_order_data.get("ticketNumber", "未知编号"),
+                severityLevel=work_order_data.get("severityLevel", "未知"),
+                ticketType=work_order_data.get("ticketType", "未知"),
+                ticketCategory=work_order_data.get("ticketCategory", "未知"),
+                collaborationType=work_order_data.get("collaborationType", "未知"),
+                responsibleUnit=work_order_data.get("responsibleUnit", "未知部门"),
+                assistingUnit=''.join(work_order_data.get("assistingUnit", [])),
+                location=work_order_data.get("location", "未知位置"),
+                channel=work_order_data.get("channel", "手机"),
+                contact=work_order_data.get("contact", "需补充联系人信息"),
+                impactRange=work_order_data.get("impactRange", "影响范围未知"),
+                work_content=work_order_data.get("summary", user_content),
+                work_status="未处理",
+                work_form_score=0.0,
+            )
+            
+            db.add(user_report_entry)
+            db.add(work_order_entry)
+            db.commit()
+            db.refresh(user_report_entry)
+            db.refresh(work_order_entry)
+            
+            print(f"工单已保存到数据库: {work_order_entry.work_order_number}")
+        except Exception as e:
+            db.rollback()
+            print(f"保存工单到数据库时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            # 即使保存失败，也返回生成的工单数据
 
     return {'ai_reply': work_order_data}
+
+
+@app.post("/gen-form/")
+async def gen_form_endpoint(user_content: str = Form(None), db: Session = Depends(get_db)) -> dict:
+    """
+    调用PA agent,生成工单（路由端点）
+    :param user_content: 用户提交的问题内容（可选，若为空则从 pa_token_manager 获取）
+    :param db: 数据库会话（由依赖注入提供）
+    :return: 生成的工单数据
+    """
+    return await gen_form(user_content, db)
 
 
 @app.get("/get-weather")
@@ -680,17 +699,23 @@ async def get_weather():
     """
     weather_base_url = os.getenv("WEATHER_BASE_URL")
     url = "/v7/weather/now"
-    async with ClientSession() as session:
-        params = {'location': "101270701"}
-        async with session.get(
-                weather_base_url + url,
-                params=params, headers={"X-QW-Api-Key": os.getenv("WEATHER_API_KEY")}
-        ) as resp:
-            if resp.status == 200:
-                response_json = await resp.json(encoding="utf-8")
-                return response_json
-            else:
-                return {"message": "Something went wrong."}
+    # 设置5秒超时，避免阻塞主流程
+    timeout = ClientTimeout(total=5)
+    try:
+        async with ClientSession(timeout=timeout) as session:
+            params = {'location': "101270701"}
+            async with session.get(
+                    weather_base_url + url,
+                    params=params, headers={"X-QW-Api-Key": os.getenv("WEATHER_API_KEY")}
+            ) as resp:
+                if resp.status == 200:
+                    response_json = await resp.json(encoding="utf-8")
+                    return response_json
+                else:
+                    return {"now": {}}  # 返回空字典，避免影响主流程
+    except Exception as e:
+        print(f"获取天气信息失败: {e}")
+        return {"now": {}}  # 返回空字典，避免影响主流程
 
 
 @app.get("/get-holiday/")
@@ -707,13 +732,19 @@ async def get_holiday():
         "key": os.getenv("HOLIDAY_API_KEY"),
         "date": datetime.now().strftime("%Y-%m-%d"),
     }
-    async with ClientSession() as session:
-        async with session.get(url, params=params, headers=headers) as resp:
-            if resp.status == 200:
-                response_json = await resp.json(encoding="utf-8")
-                return response_json['result']["statusDesc"]
-            else:
-                return {"message": "Something went wrong."}
+    # 设置5秒超时，避免阻塞主流程
+    timeout = ClientTimeout(total=5)
+    try:
+        async with ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    response_json = await resp.json(encoding="utf-8")
+                    return response_json.get('result', {}).get("statusDesc", "工作日")
+                else:
+                    return "工作日"  # 默认返回工作日，避免影响主流程
+    except Exception as e:
+        print(f"获取节假日信息失败: {e}")
+        return "工作日"  # 默认返回工作日，避免影响主流程
 
 
 @app.post("/get-solution/")
@@ -721,6 +752,7 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
     """
     获取解决方案
     :param work_order_content: 工单内容（可选，如果不提供则使用pa_token_manager.user_question）
+    :param work_order_number: 工单编号（可选，用于更新该工单处理状态与关联处置方案）
     :return: ai回复
     """
     try:
@@ -739,14 +771,15 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
                 db_session.commit()
 
         url = "/basic/openapi/engine/chat/v1/completions"
-        weather_info = await get_weather()
-        holiday_info = await get_holiday()
+        # weather_info = await get_weather()
+        # holiday_info = await get_holiday()
         data = {
             "chatId": "1414934653136449536",
             "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
             "messages": [
                 {
-                    "content": "生成处置流程和处理方案." + user_content + f"当地天气信息：{weather_info.get('now', {})},当天是否为节假日:{holiday_info}",
+                    "content": "生成处置流程和处理方案." + user_content,
+                    # "content": "生成处置流程和处理方案." + user_content + f"当地天气信息：{weather_info.get('now', {})},当天是否为节假日:{holiday_info}",
                     "role": "user"
                 }
             ]
@@ -776,10 +809,10 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
 async def get_judge(process_result:str, process_content:str,public_visit:str, work_order_number: str):
     """
     获取工单评分
-    :process_result:处理结果
-    :process_content:处置过程
-    :public_visit:群众回访
-    :param work_order_number:工单编号
+    :param process_result: 处理结果
+    :param process_content: 处置过程
+    :param public_visit: 群众回访
+    :param work_order_number: 工单编号
     :return:
     """
     form_info = pa_token_manager.form_info or None
@@ -845,7 +878,7 @@ def save_work_order_number(
 ):
     """
     保存工单编号
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :param work_order_number: 工单编号
     :return:
     """
@@ -866,7 +899,7 @@ def get_work_order_status(
 ):
     """
     获取工单状态
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :param work_order_number: 工单编号
     :return:
     """
@@ -885,7 +918,7 @@ async def get_work_order_no_score(
 ):
     """
     获取待评分工单列表（work_form_score为None或0的工单）
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :param limit: 返回工单数量限制，默认50条
     :return: 待评分工单列表
     """
@@ -974,7 +1007,7 @@ async def get_work_order_scored(
 ):
     """
     获取已评分工单列表（work_form_score不为None且不为0的工单）
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :param limit: 返回工单数量限制，默认50条
     :return: 已评分工单列表
     """
@@ -1064,7 +1097,7 @@ async def get_work_order_detail(
     """
     获取工单详情
     :param work_order_id: 工单ID
-    :param db:
+    :param db: 数据库会话（由依赖注入提供）
     :return: 工单详情
     """
     try:
