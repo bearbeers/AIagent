@@ -14,7 +14,10 @@ async def main():
         ]
     }
 
-    res_json = request_pa('https://chatgpt.sncitybrain.com:30080'+ url, data, token="eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3NjcxODUxNTMsInN1YiI6IjE3MDIxIiwiSldUX0VOVElUWSI6eyJ0b2tlbklkIjoiZjZkNGE2YTFmZDhkNGNlY2EzMzU0MDVkYjE2M2UxMzkiLCJ1c2VySWQiOjE3MDIxLCJlbWFpbCI6bnVsbCwib3JnSWQiOm51bGwsInVzZXJOYW1lIjpudWxsLCJ0ZW5hbnRJZCI6InpudGRzMSIsImRlZmF1bHRMYWJJZCI6bnVsbCwiYWNjZXNzS2V5IjoiYWstMTI2YzcxY2E1ZDdhNGNlZGIyMzgiLCJ0aGlyZFNvdXJjZSI6bnVsbCwidGhpcmRVc2VySWQiOm51bGwsInRoaXJkVXNlck5hbWUiOm51bGwsInRoaXJkVXNlckVtYWlsIjpudWxsLCJ0aGlyZFVzZXJUZW5hbnRJZCI6bnVsbH19.BmGw2i92UBrST0LI8Vpn3-TNU0jW8p9MdGRNiTeuH1o")
+    res_json = request_pa(
+        'https://chatgpt.sncitybrain.com:30080'+ url,
+        data,
+        token="eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3Njc0OTc1MzUsInN1YiI6IjE3MDIxIiwiSldUX0VOVElUWSI6eyJ0b2tlbklkIjoiOGI0NWVmZDI3NGRhNGU3Mzk4M2MwZDJjNGZkMWU3OTIiLCJ1c2VySWQiOjE3MDIxLCJlbWFpbCI6bnVsbCwib3JnSWQiOm51bGwsInVzZXJOYW1lIjpudWxsLCJ0ZW5hbnRJZCI6InpudGRzMSIsImRlZmF1bHRMYWJJZCI6bnVsbCwiYWNjZXNzS2V5IjoiYWstMTI2YzcxY2E1ZDdhNGNlZGIyMzgiLCJ0aGlyZFNvdXJjZSI6bnVsbCwidGhpcmRVc2VySWQiOm51bGwsInRoaXJkVXNlck5hbWUiOm51bGwsInRoaXJkVXNlckVtYWlsIjpudWxsLCJ0aGlyZFVzZXJUZW5hbnRJZCI6bnVsbH19.qtNHJa_MycTzMBYgFCUq-42dK0PvN7bydYZAkBV5X7M")
     ai_reply = res_json['choices'][0]['message']['content']
     print(ai_reply)
 

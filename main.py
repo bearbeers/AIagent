@@ -36,8 +36,8 @@ async def lifespan(application: FastAPI):
 
         # 获取初始token
         a = await pa_token_manager.refresh_token()
-        print("Initial token fetched successfully")
         print(a)
+        print("Initial token fetched successfully")
 
         # 初始化热度分析器并从数据库加载数据
         hotspot_ranker = MunicipalHotspotRanker(similarity_threshold=0.6)

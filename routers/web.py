@@ -78,7 +78,6 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
     """
     ticket_info = await gen_form(user_content, db)
     ticket_info = ticket_info.get("ai_reply")
-    print(ticket_info)
     ticket_info_data = WorkOrderNumber(
         work_order_number=ticket_info.get("ticketNumber", ""),
         severityLevel=ticket_info.get("severityLevel"),
@@ -92,18 +91,19 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
         contact=ticket_info.get("contact"),
         impactRange=ticket_info.get("impactRange"),
         work_content=ticket_info.get("summary"),
+        user_phone=ticket_info.get("phone")
     )
-    ticket_info_entry = WorkOrderNumberTable(
-        **ticket_info_data.model_dump()
-    )
-
-    db.add(ticket_info_entry)
-    db.commit()
-    db.refresh(ticket_info_entry)
+    # ticket_info_entry = WorkOrderNumberTable(
+    #     **ticket_info_data.model_dump()
+    # )
+    #
+    # db.add(ticket_info_entry)
+    # db.commit()
+    # db.refresh(ticket_info_entry)
 
     # 保存UserReportTable，将user_content保存为report_content，用于匹配severityLevel
     user_report = UserReport(
-        report_id=ticket_info_entry.work_order_number,
+        report_id=ticket_info_data.work_order_number,
         report_content=user_content,  # 保存原始用户输入，用于匹配
         report_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         report_status="未处理"
@@ -332,6 +332,7 @@ async def get_work_order_by_issue(issue: str, db: Session = Depends(get_db)):
                 "work_content": work_order.work_content,
                 "work_status": work_order.work_status,
                 "report_time": work_order.report_time.strftime("%Y-%m-%d %H:%M:%S") if work_order.report_time else None,
+                "phone": work_order.user_phone
             }
         pa_token_manager.work_form_number = work_order.work_order_number
         return JSONResponse({"error": "未找到对应的工单信息"}, status_code=404)
@@ -550,7 +551,7 @@ async def audio_to_text(audio_file: bytes = File(...)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-async def gen_form(user_content: str = None, db: Session = None) -> dict:
+async def gen_form(user_content: str = None, db: Session = None):
     """
     调用PA agent,生成工单（内部函数）
     :param user_content: 用户提交的问题内容（可选，若为空则从 pa_token_manager 获取）
@@ -661,6 +662,7 @@ async def gen_form(user_content: str = None, db: Session = None) -> dict:
                 work_content=work_order_data.get("summary", user_content),
                 work_status="未处理",
                 work_form_score=0.0,
+                user_phone=work_order_data.get("phone", ""),
             )
             
             db.add(user_report_entry)
@@ -681,7 +683,7 @@ async def gen_form(user_content: str = None, db: Session = None) -> dict:
 
 
 @app.post("/gen-form/")
-async def gen_form_endpoint(user_content: str = Form(None), db: Session = Depends(get_db)) -> dict:
+async def gen_form_endpoint(user_content: str = Form(None), db: Session = Depends(get_db)):
     """
     调用PA agent,生成工单（路由端点）
     :param user_content: 用户提交的问题内容（可选，若为空则从 pa_token_manager 获取）
