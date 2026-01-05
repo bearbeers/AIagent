@@ -1,16 +1,17 @@
+import time
 from datetime import datetime
 import json
 import uuid
 import os
 from typing import Any, Dict
 from aiohttp.client import ClientSession
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, connector
 from aiohttp.formdata import FormData
 from fastapi import APIRouter, File, Form, WebSocket, Depends
 from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
 from sqlalchemy.orm import Session
-
+import ssl
 from model.db import get_db, UserReport, UserReportTable, ProcessTable, WorkPlanTable, ScoreTable
 from model.db import WorkOrderNumber, WorkOrderNumberTable
 from utils.json_handle import get_json_string
@@ -18,6 +19,7 @@ from utils.request_pa import request_pa
 from utils.save_pa_token import PaTokenManager
 from utils.hot_spot import MunicipalHotspotRanker
 from dotenv import load_dotenv
+import aiohttp
 
 load_dotenv()
 app = APIRouter()
@@ -28,7 +30,9 @@ redis_client = None
 pa_token_manager = PaTokenManager()
 BASE_URL = os.getenv("DIFY_BASE_URL")
 API_KEY = os.getenv("DIFY_API_KEY")
-
+CIPHER: str = 'AES128-SHA:AES256-SHA:AES256-SHA256'
+CONTENT = ssl._create_unverified_context()
+CONTENT.set_ciphers(CIPHER)
 
 
 @app.websocket("/ws/notifications")
@@ -49,6 +53,25 @@ async def websocket_notifications(websocket: WebSocket):
         websocket_connections.discard(websocket)
         if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close()
+
+
+async def get_token():
+    api_url: str = '/basic/openapi/auth/v1/api-key/token'
+    data: dict[str, str] = {
+        'ak': os.getenv("AK"),
+        'sk': os.getenv("SK"),
+    }
+    data_json = json.dumps(data).encode('utf-8')
+    connector = aiohttp.TCPConnector(ssl=CONTENT)
+    header = {
+        'Content-Type': 'application/json',
+    }
+    async with ClientSession(connector=connector, headers=header) as session:
+        async with session.post(os.getenv('PA_BASE_URL') + api_url, data=data_json) as resp:
+            if resp.status == 200:
+                res_json = await resp.json()
+                return res_json['data']['token']
+            return None
 
 
 async def broadcast_notification(message: dict):
@@ -109,7 +132,10 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
         report_status="未处理"
     )
     user_report_entry = UserReportTable(
-        **user_report.model_dump()
+        report_id=ticket_info_data.work_order_number,
+        report_content=user_content,  # 保存原始用户输入，用于匹配
+        report_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        report_status="未处理"
     )
     db.add(user_report_entry)
     db.commit()
@@ -514,7 +540,7 @@ async def audio_to_text(audio_file: bytes = File(...)):
             {"error": "服务器配置错误: DIFY_API_KEY 环境变量未设置"},
             status_code=500
         )
-    
+
     try:
         url = "/audio-to-text"
         async with ClientSession() as session:
@@ -565,7 +591,7 @@ async def gen_form(user_content: str = None, db: Session = None):
 
     url = "/basic/openapi/engine/chat/v1/completions"
     data = {
-        "chatId": "1414934653136449536",
+        "chatId": "1414934653136449537",
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
@@ -575,7 +601,7 @@ async def gen_form(user_content: str = None, db: Session = None):
         ]
     }
 
-    res_json = request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
+    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
     ai_reply = res_json['choices'][0]['message']['content']
 
     # 解析AI回复，获取工单数据
@@ -644,7 +670,7 @@ async def gen_form(user_content: str = None, db: Session = None):
                 report_time=user_report.report_time,
                 report_type=user_report.report_type
             )
-            
+
             # 直接创建 WorkOrderNumberTable 对象，使用 datetime 对象而不是字符串
             work_order_entry = WorkOrderNumberTable(
                 report_time=report_time,  # 使用 datetime 对象
@@ -664,13 +690,13 @@ async def gen_form(user_content: str = None, db: Session = None):
                 work_form_score=0.0,
                 user_phone=work_order_data.get("phone", ""),
             )
-            
+
             db.add(user_report_entry)
             db.add(work_order_entry)
             db.commit()
             db.refresh(user_report_entry)
             db.refresh(work_order_entry)
-            
+
             print(f"工单已保存到数据库: {work_order_entry.work_order_number}")
         except Exception as e:
             db.rollback()
@@ -749,8 +775,26 @@ async def get_holiday():
         return "工作日"  # 默认返回工作日，避免影响主流程
 
 
+async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None)):
+    db_session = next(get_db())
+    work_order_entry = (db_session.query(WorkOrderNumberTable)
+                        .filter(WorkOrderNumberTable.work_order_number == work_order_number)
+                        .first())
+    if work_order_entry:
+        work_order_entry.work_status = "处理中"
+        db_session.commit()
+    solution_data = WorkPlanTable(
+        work_form_id=work_order_number,
+        work_plan_content=ai_reply
+    )
+    db_session.add(
+        solution_data
+    )
+    db_session.commit()
+
+
 @app.post("/get-solution/")
-async def get_solution(work_order_content: str = Form(None), work_order_number:str=Form(None)):
+async def get_solution(work_order_content: str = Form(None), work_order_number: str = Form(None)):
     """
     获取解决方案
     :param work_order_content: 工单内容（可选，如果不提供则使用pa_token_manager.user_question）
@@ -763,20 +807,12 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
 
         if not user_content:
             return JSONResponse({"error": "工单内容不能为空"}, status_code=400)
-        db_session = next(get_db())
-        work_order_entry = (db_session.query(WorkOrderNumberTable)
-                            .filter(WorkOrderNumberTable.work_order_number == work_order_number)
-                            .all())
-        if work_order_entry:
-            for entry in work_order_entry:
-                entry.work_status = "处理中"
-                db_session.commit()
+        weather_info = await get_weather()
+        holiday_info = await get_holiday()
 
         url = "/basic/openapi/engine/chat/v1/completions"
-        # weather_info = await get_weather()
-        # holiday_info = await get_holiday()
         data = {
-            "chatId": "1414934653136449536",
+            "chatId": "1414934653136449537",
             "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
             "messages": [
                 {
@@ -787,19 +823,23 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
             ]
         }
 
-        res_json = request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
-        ai_reply = res_json['choices'][0]['message']['content']
-        ai_reply_json = get_json_string(ai_reply)
-        solution_data = WorkPlanTable(
-            work_form_id=work_order_number,
-            work_plan_content=ai_reply
-        )
-        db_session.add(
-            solution_data
-        )
-        db_session.commit()
-        return ai_reply_json
+        header = {
+            'Content-Type': 'application/json',
+            'token': await get_token(),
+        }
+        connect = aiohttp.TCPConnector(ssl=CONTENT)
+        async with ClientSession(connector=connect, timeout=ClientTimeout(180)) as session:
+            async with session.post(os.getenv('PA_BASE_URL') + url, data=json.dumps(data).encode('utf-8'),headers=header) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    ai_reply = res_json['choices'][0]['message']['content']
 
+                    ai_reply_json = get_json_string(ai_reply)
+                    await get_solution_save_db(ai_reply, work_order_number)
+                    return ai_reply_json
+                else:
+                    res_json = await resp.text(encoding="utf-8")
+                    print('error', res_json)
     except Exception as e:
         print(f"Error in get_solution: {e}")
         import traceback
@@ -807,8 +847,10 @@ async def get_solution(work_order_content: str = Form(None), work_order_number:s
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+
+
 @app.post("/get-judge/")
-async def get_judge(process_result:str, process_content:str,public_visit:str, work_order_number: str):
+async def get_judge(process_result: str, process_content: str, public_visit: str, work_order_number: str):
     """
     获取工单评分
     :param process_result: 处理结果
@@ -819,7 +861,7 @@ async def get_judge(process_result:str, process_content:str,public_visit:str, wo
     """
     form_info = pa_token_manager.form_info or None
     data = {
-        "chatId": "1414934653136449536",
+        "chatId": "1414934653136449537",
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
@@ -829,7 +871,7 @@ async def get_judge(process_result:str, process_content:str,public_visit:str, wo
         ]
     }
     url = "/basic/openapi/engine/chat/v1/completions"
-    res_json = request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
+    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
     ai_reply = res_json['choices'][0]['message']['content']
     json_string = get_json_string(ai_reply)
 
@@ -927,8 +969,9 @@ async def get_work_order_no_score(
     try:
         # 查询work_form_score为None或0的工单
         work_orders = db.query(WorkOrderNumberTable).filter(
-            (WorkOrderNumberTable.work_form_score.is_(None)) |
-            (WorkOrderNumberTable.work_form_score == 0.0)
+            ((WorkOrderNumberTable.work_form_score.is_(None)) |
+             (WorkOrderNumberTable.work_form_score == 0.0)) &
+            (WorkOrderNumberTable.work_status == '处理中')
         ).order_by(WorkOrderNumberTable.report_time.desc()).limit(limit).all()
 
         result = []
@@ -1126,4 +1169,3 @@ async def get_work_order_detail(
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
-
