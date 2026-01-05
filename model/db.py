@@ -31,6 +31,7 @@ class WorkOrderNumberTable(Base):
     work_content = Column(String)
     work_status = Column(String)
     work_form_score = Column(Float)
+    hotspot_priority = Column(Integer, default=0)  # 保存生成处置方案时的热度值
     user_phone = Column(String, ForeignKey("user_info.user_phone"))
 
 

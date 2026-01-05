@@ -1,4 +1,5 @@
-import time
+import re
+import traceback
 from datetime import datetime
 import json
 import uuid
@@ -33,6 +34,62 @@ API_KEY = os.getenv("DIFY_API_KEY")
 CIPHER: str = 'AES128-SHA:AES256-SHA:AES256-SHA256'
 CONTENT = ssl._create_unverified_context()
 CONTENT.set_ciphers(CIPHER)
+
+
+def get_work_order_priority(work_content: str, report_content: str = None) -> int:
+    """
+    根据工单内容从热度分析器获取真实的热度值（priority）
+    :param work_content: 工单内容（work_content）
+    :param report_content: 上报内容（report_content），可选
+    :return: 热度值（count），如果找不到则返回0
+    """
+    try:
+        # 确保热度分析器已初始化
+        if hotspot_ranker is None:
+            return 0
+        
+        # 优先使用 report_content（因为热度分析器使用的是 user_content）
+        content_to_match = report_content or work_content
+        
+        if not content_to_match or not content_to_match.strip():
+            return 0
+        
+        # 方法1：使用 find_similar_reports 查找最相似的报告（更准确）
+        similar_reports = hotspot_ranker.find_similar_reports(content_to_match.strip(), top_k=1)
+        if similar_reports and len(similar_reports) > 0:
+            # 找到了相似报告，获取其所属聚类的count
+            similar_report_text = similar_reports[0][0]
+            clusters = hotspot_ranker.get_clusters()
+            
+            # 查找该报告所属的聚类
+            for cluster_id, cluster_info in clusters.items():
+                cluster_reports = cluster_info.get('reports', [])
+                if similar_report_text in cluster_reports:
+                    return cluster_info.get('count', 0)
+        
+        # 方法2：直接遍历聚类进行匹配（备用方法）
+        clusters = hotspot_ranker.get_clusters()
+        for cluster_id, cluster_info in clusters.items():
+            cluster_reports = cluster_info.get('reports', [])
+            
+            # 精确匹配
+            if content_to_match.strip() in cluster_reports:
+                return cluster_info.get('count', 0)
+            
+            # 模糊匹配（检查内容是否相似）
+            for report in cluster_reports:
+                if report and content_to_match:
+                    # 如果内容相似（包含关系），返回该聚类的count
+                    if content_to_match.strip() in report or report in content_to_match.strip():
+                        return cluster_info.get('count', 0)
+        
+        # 如果找不到匹配的聚类，返回0
+        return 0
+    except Exception as e:
+        print(f"获取工单热度值失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
 
 @app.websocket("/ws/notifications")
@@ -116,21 +173,7 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
         work_content=ticket_info.get("summary"),
         user_phone=ticket_info.get("phone")
     )
-    # ticket_info_entry = WorkOrderNumberTable(
-    #     **ticket_info_data.model_dump()
-    # )
-    #
-    # db.add(ticket_info_entry)
-    # db.commit()
-    # db.refresh(ticket_info_entry)
 
-    # 保存UserReportTable，将user_content保存为report_content，用于匹配severityLevel
-    user_report = UserReport(
-        report_id=ticket_info_data.work_order_number,
-        report_content=user_content,  # 保存原始用户输入，用于匹配
-        report_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        report_status="未处理"
-    )
     user_report_entry = UserReportTable(
         report_id=ticket_info_data.work_order_number,
         report_content=user_content,  # 保存原始用户输入，用于匹配
@@ -207,14 +250,27 @@ async def get_dispatch_work_orders(
         if status:
             query = query.filter(WorkOrderNumberTable.work_status == status)
         else:
-            # 默认获取未处理的工单
+            # 默认获取未处理的工单，且排除已完成评分的工单
             query = query.filter(
-                (WorkOrderNumberTable.work_status == '未处理') |
-                (WorkOrderNumberTable.work_status.is_(None))
+                ((WorkOrderNumberTable.work_status == '未处理') |
+                 (WorkOrderNumberTable.work_status.is_(None))),
+                # 排除已完成评分的工单：work_form_score为None或0
+                ((WorkOrderNumberTable.work_form_score.is_(None)) |
+                 (WorkOrderNumberTable.work_form_score == 0.0))
             )
 
         work_orders = query.order_by(WorkOrderNumberTable.report_time.desc()).limit(limit).all()
 
+        # 确保热度分析器已加载最新数据
+        try:
+            db_session_for_hotspot = next(get_db())
+            try:
+                hotspot_ranker.reload_from_database(db_session_for_hotspot)
+            finally:
+                db_session_for_hotspot.close()
+        except Exception as e:
+            print(f"刷新热度分析器数据失败: {e}")
+        
         result = []
         for wo in work_orders:
             # 判断紧急程度
@@ -246,6 +302,22 @@ async def get_dispatch_work_orders(
                 except:
                     pass
 
+            # 优先使用保存的热度值（生成处置方案时的热度值）
+            # 如果没有保存的热度值，则从热度分析器获取当前热度值
+            if wo.hotspot_priority and wo.hotspot_priority > 0:
+                priority = wo.hotspot_priority
+            else:
+                # 获取上报内容（report_content）用于匹配热度
+                report_content = None
+                user_report = db.query(UserReportTable).filter(
+                    UserReportTable.report_id == wo.work_order_number
+                ).first()
+                if user_report and user_report.report_content:
+                    report_content = user_report.report_content
+                
+                # 从热度分析器获取当前的热度值
+                priority = get_work_order_priority(wo.work_content or "", report_content)
+
             result.append({
                 "id": str(wo.id),
                 "work_order_number": wo.work_order_number,
@@ -258,7 +330,7 @@ async def get_dispatch_work_orders(
                 "time": time_str,
                 "responsibleUnit": wo.responsibleUnit or "待分配",
                 "summary": wo.work_content or "",
-                "priority": 0,  # 可以根据需要计算优先级
+                "priority": priority,  # 优先使用保存的热度值，否则使用当前热度值
                 "severityLevel": severity_level,
                 "location": wo.location or "",
                 "collaborationType": wo.collaborationType or "跨单位协同处置",
@@ -397,9 +469,13 @@ async def get_hotspot_ranking(top_k: int = 10, refresh: bool = True):
         db_session = next(get_db())
         try:
             # 查询所有工单的work_content和severityLevel
+            # 排除已完成评分的工单（work_form_score不为None且不为0）
             work_orders = db_session.query(WorkOrderNumberTable).filter(
                 WorkOrderNumberTable.work_content.isnot(None),
-                WorkOrderNumberTable.severityLevel.isnot(None)
+                WorkOrderNumberTable.severityLevel.isnot(None),
+                # 排除已完成评分的工单
+                ((WorkOrderNumberTable.work_form_score.is_(None)) |
+                 (WorkOrderNumberTable.work_form_score == 0.0))
             ).all()
 
             # 建立work_content到severityLevel的映射（支持模糊匹配）
@@ -418,12 +494,16 @@ async def get_hotspot_ranking(top_k: int = 10, refresh: bool = True):
 
             # 建立report_content（user_content）到severityLevel的映射
             # 通过report_id关联到WorkOrderNumberTable
+            # 只映射未完成评分的工单
             user_content_to_severity = {}
             for ur in user_reports:
                 if ur.report_content and ur.report_id:
-                    # 通过report_id找到对应的工单
+                    # 通过report_id找到对应的工单，且排除已完成评分的工单
                     work_order = db_session.query(WorkOrderNumberTable).filter(
-                        WorkOrderNumberTable.work_order_number == ur.report_id
+                        WorkOrderNumberTable.work_order_number == ur.report_id,
+                        # 排除已完成评分的工单
+                        ((WorkOrderNumberTable.work_form_score.is_(None)) |
+                         (WorkOrderNumberTable.work_form_score == 0.0))
                     ).first()
                     if work_order and work_order.severityLevel:
                         user_content_to_severity[ur.report_content] = work_order.severityLevel
@@ -591,7 +671,7 @@ async def gen_form(user_content: str = None, db: Session = None):
 
     url = "/basic/openapi/engine/chat/v1/completions"
     data = {
-        "chatId": "1414934653136449537",
+        "chatId": "1414934653136449536",
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
@@ -601,7 +681,7 @@ async def gen_form(user_content: str = None, db: Session = None):
         ]
     }
 
-    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
+    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await get_token())
     ai_reply = res_json['choices'][0]['message']['content']
 
     # 解析AI回复，获取工单数据
@@ -655,22 +735,6 @@ async def gen_form(user_content: str = None, db: Session = None):
                 # 如果解析失败，使用当前时间
                 report_time = datetime.now()
 
-            user_report = UserReport(
-                user_id='',
-                report_id=work_order_data.get("ticketNumber", "未知编号"),
-                report_content=work_order_data.get("summary", user_content),
-                report_time=report_time_str,
-                report_type="工单"
-            )
-
-            user_report_entry = UserReportTable(
-                user_id=user_report.user_id,
-                report_id=user_report.report_id,
-                report_content=user_report.report_content,
-                report_time=user_report.report_time,
-                report_type=user_report.report_type
-            )
-
             # 直接创建 WorkOrderNumberTable 对象，使用 datetime 对象而不是字符串
             work_order_entry = WorkOrderNumberTable(
                 report_time=report_time,  # 使用 datetime 对象
@@ -691,18 +755,14 @@ async def gen_form(user_content: str = None, db: Session = None):
                 user_phone=work_order_data.get("phone", ""),
             )
 
-            db.add(user_report_entry)
             db.add(work_order_entry)
             db.commit()
-            db.refresh(user_report_entry)
             db.refresh(work_order_entry)
 
             print(f"工单已保存到数据库: {work_order_entry.work_order_number}")
         except Exception as e:
             db.rollback()
             print(f"保存工单到数据库时出错: {e}")
-            import traceback
-            traceback.print_exc()
             # 即使保存失败，也返回生成的工单数据
 
     return {'ai_reply': work_order_data}
@@ -781,7 +841,34 @@ async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None
                         .filter(WorkOrderNumberTable.work_order_number == work_order_number)
                         .first())
     if work_order_entry:
-        work_order_entry.work_status = "处理中"
+        work_order_entry.work_status = "已处理"
+        
+        # 获取并保存生成处置方案时的热度值
+        try:
+            # 确保热度分析器已加载最新数据
+            hotspot_ranker.reload_from_database(db_session)
+            
+            # 获取上报内容（report_content）用于匹配热度
+            from model.db import UserReportTable
+            report_content = None
+            user_report = db_session.query(UserReportTable).filter(
+                UserReportTable.report_id == work_order_number
+            ).first()
+            if user_report and user_report.report_content:
+                report_content = user_report.report_content
+            
+            # 获取当前热度值并保存
+            hotspot_priority = get_work_order_priority(
+                work_order_entry.work_content or "", 
+                report_content
+            )
+            work_order_entry.hotspot_priority = hotspot_priority
+            print(f"保存工单 {work_order_number} 的热度值: {hotspot_priority}")
+        except Exception as e:
+            print(f"获取并保存热度值失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
         db_session.commit()
     solution_data = WorkPlanTable(
         work_form_id=work_order_number,
@@ -807,8 +894,8 @@ async def get_solution(work_order_content: str = Form(None), work_order_number: 
 
         if not user_content:
             return JSONResponse({"error": "工单内容不能为空"}, status_code=400)
-        weather_info = await get_weather()
-        holiday_info = await get_holiday()
+        # weather_info = await get_weather()
+        # holiday_info = await get_holiday()
 
         url = "/basic/openapi/engine/chat/v1/completions"
         data = {
@@ -970,9 +1057,19 @@ async def get_work_order_no_score(
         # 查询work_form_score为None或0的工单
         work_orders = db.query(WorkOrderNumberTable).filter(
             ((WorkOrderNumberTable.work_form_score.is_(None)) |
-             (WorkOrderNumberTable.work_form_score == 0.0)) &
-            (WorkOrderNumberTable.work_status == '处理中')
+             (WorkOrderNumberTable.work_form_score == 0.0))
+            # (WorkOrderNumberTable.work_status == '处理中')
         ).order_by(WorkOrderNumberTable.report_time.desc()).limit(limit).all()
+
+        # 确保热度分析器已加载最新数据
+        try:
+            db_session_for_hotspot = next(get_db())
+            try:
+                hotspot_ranker.reload_from_database(db_session_for_hotspot)
+            finally:
+                db_session_for_hotspot.close()
+        except Exception as e:
+            print(f"刷新热度分析器数据失败: {e}")
 
         result = []
         for wo in work_orders:
@@ -1005,6 +1102,22 @@ async def get_work_order_no_score(
                 except:
                     pass
 
+            # 优先使用保存的热度值（生成处置方案时的热度值）
+            # 如果没有保存的热度值，则从热度分析器获取当前热度值
+            if wo.hotspot_priority and wo.hotspot_priority > 0:
+                priority = wo.hotspot_priority
+            else:
+                # 获取上报内容（report_content）用于匹配热度
+                report_content = None
+                user_report = db.query(UserReportTable).filter(
+                    UserReportTable.report_id == wo.work_order_number
+                ).first()
+                if user_report and user_report.report_content:
+                    report_content = user_report.report_content
+                
+                # 从热度分析器获取当前的热度值
+                priority = get_work_order_priority(wo.work_content or "", report_content)
+
             result.append({
                 "id": str(wo.id),
                 "work_order_number": wo.work_order_number,
@@ -1017,7 +1130,7 @@ async def get_work_order_no_score(
                 "time": time_str,
                 "responsibleUnit": wo.responsibleUnit or "待分配",
                 "summary": wo.work_content or "",
-                "priority": 99 if urgency_level == "urgent" else 0,  # 紧急工单显示99
+                "priority": priority,  # 优先使用保存的热度值，否则使用当前热度值
                 "severityLevel": severity_level,
                 "location": wo.location or "",
                 "collaborationType": wo.collaborationType or "跨单位协同处置",
@@ -1063,6 +1176,16 @@ async def get_work_order_scored(
             WorkOrderNumberTable.work_form_score != 0.0
         ).order_by(WorkOrderNumberTable.report_time.desc()).limit(limit).all()
 
+        # 确保热度分析器已加载最新数据（已评分工单也需要显示热度）
+        try:
+            db_session_for_hotspot = next(get_db())
+            try:
+                hotspot_ranker.reload_from_database(db_session_for_hotspot)
+            finally:
+                db_session_for_hotspot.close()
+        except Exception as e:
+            print(f"刷新热度分析器数据失败: {e}")
+
         result = []
         for wo in scored_orders:
             # 判断紧急程度
@@ -1094,6 +1217,22 @@ async def get_work_order_scored(
                 except:
                     pass
 
+            # 优先使用保存的热度值（生成处置方案时的热度值）
+            # 如果没有保存的热度值，则从热度分析器获取当前热度值
+            if wo.hotspot_priority and wo.hotspot_priority > 0:
+                priority = wo.hotspot_priority
+            else:
+                # 获取上报内容（report_content）用于匹配热度
+                report_content = None
+                user_report = db.query(UserReportTable).filter(
+                    UserReportTable.report_id == wo.work_order_number
+                ).first()
+                if user_report and user_report.report_content:
+                    report_content = user_report.report_content
+                
+                # 从热度分析器获取当前的热度值
+                priority = get_work_order_priority(wo.work_content or "", report_content)
+
             result.append({
                 "id": str(wo.id),
                 "work_order_number": wo.work_order_number,
@@ -1106,7 +1245,7 @@ async def get_work_order_scored(
                 "time": time_str,
                 "responsibleUnit": wo.responsibleUnit or "待分配",
                 "summary": wo.work_content or "",
-                "priority": 99 if urgency_level == "urgent" else 0,
+                "priority": priority,  # 优先使用保存的热度值，否则使用当前热度值
                 "severityLevel": severity_level,
                 "location": wo.location or "",
                 "collaborationType": wo.collaborationType or "跨单位协同处置",
@@ -1145,6 +1284,7 @@ async def get_work_order_detail(
     :param db: 数据库会话（由依赖注入提供）
     :return: 工单详情
     """
+    print(work_order_id)
     try:
         work_order_info = db.query(WorkOrderNumberTable).filter(
             WorkOrderNumberTable.work_order_number == work_order_id
@@ -1158,14 +1298,36 @@ async def get_work_order_detail(
         score_info = db.query(ScoreTable).filter(
             ScoreTable.work_form_id == work_order_id
         ).first()
-        return {
-            "work_order_info": work_order_info,
-            "process_info": process_info,
-            "solution_info": get_json_string(solution_info.work_plan_content),
-            "score_info": get_json_string(score_info.score_content)
-        }
+        user_orignal_content = db.query(UserReportTable).filter(
+            UserReportTable.report_id == work_order_id
+        ).first()
+        if user_orignal_content:
+            match = re.search(r"问题[:：]\s*(.*)", user_orignal_content.report_content)
+            return {
+                "work_order_info": work_order_info,
+                "process_info": process_info,
+                "solution_info": get_json_string(solution_info.work_plan_content) if solution_info.work_plan_content  is not None else "",
+                "score_info": get_json_string(score_info.score_content) if score_info else "",
+                'original_content': match.group(1).strip() if match else ""
+            }
     except Exception as e:
         print(f"Error in get_work_order_detail: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/get-original-content/")
+async def get_original_content(work_order_id: str, db: Session = Depends(get_db)):
+    try:
+        work_order_info = db.query(UserReportTable).filter(
+            UserReportTable.report_id == work_order_id
+        ).first()
+        match = re.search(r"问题[:：]\s*(.*)", work_order_info.report_content)
+        if match:
+            return {"original_content": match.group(1).strip()}
+        else:
+            return {"original_content": ""}
+    except Exception as e:
+        print(f"Error in get_original_content: {e}")
+        traceback.print_exc()

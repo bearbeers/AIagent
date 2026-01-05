@@ -16,7 +16,7 @@ async def request_pa(url, data, token):
     """
     data_json = json.dumps(data).encode('utf-8')
     connector = TCPConnector(ssl_context=CONTENT)
-    timeout = ClientTimeout(total=180)
+    timeout = ClientTimeout(total=300)
     async with ClientSession(connector=connector, timeout=timeout) as session:
         res = await session.post(
             url,

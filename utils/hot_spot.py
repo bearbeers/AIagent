@@ -261,10 +261,15 @@ class MunicipalHotspotRanker:
             # 延迟导入避免循环依赖
             from model.db import WorkOrderNumberTable
             
+            # 查询待受理工单：未处理且未完成评分的工单
+            # 已完成评分的工单（work_form_score不为None且不为0）不应该出现在待受理列表中
             user_reports = db_session.query(WorkOrderNumberTable).filter(
                 WorkOrderNumberTable.work_content.isnot(None),
                 WorkOrderNumberTable.work_content != '',
-                WorkOrderNumberTable.work_status == '未处理'
+                WorkOrderNumberTable.work_status == '未处理',
+                # 排除已完成评分的工单：work_form_score为None或0
+                ((WorkOrderNumberTable.work_form_score.is_(None)) |
+                 (WorkOrderNumberTable.work_form_score == 0.0))
             ).order_by(WorkOrderNumberTable.report_time.desc()).all()
             
             # 无论是否有数据，都先清空现有数据

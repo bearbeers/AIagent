@@ -92,8 +92,6 @@ async def get_complents():
                 return None
 
 
-
-
 if __name__ == '__main__':
     import asyncio
 
