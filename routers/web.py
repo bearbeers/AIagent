@@ -1,3 +1,4 @@
+import asyncio
 import re
 import traceback
 from datetime import datetime
@@ -17,18 +18,17 @@ from model.db import get_db, UserReport, UserReportTable, ProcessTable, WorkPlan
 from model.db import WorkOrderNumber, WorkOrderNumberTable
 from utils.json_handle import get_json_string
 from utils.request_pa import request_pa
-from utils.save_pa_token import PaTokenManager
+from utils.shared import pa_token_manager
 from utils.hot_spot import MunicipalHotspotRanker
 from dotenv import load_dotenv
 import aiohttp
-
+from model.db import UserReportTable
 load_dotenv()
 app = APIRouter()
 websocket_connections = set()
 hotspot_ranker = MunicipalHotspotRanker()
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = None
-pa_token_manager = PaTokenManager()
 BASE_URL = os.getenv("DIFY_BASE_URL")
 API_KEY = os.getenv("DIFY_API_KEY")
 CIPHER: str = 'AES128-SHA:AES256-SHA:AES256-SHA256'
@@ -36,12 +36,13 @@ CONTENT = ssl._create_unverified_context()
 CONTENT.set_ciphers(CIPHER)
 
 
-def get_work_order_priority(work_content: str, report_content: str = None) -> int:
+def get_work_order_priority(work_content: str, report_content: str = None, severity_level: str = None) -> int:
     """
     根据工单内容从热度分析器获取真实的热度值（priority）
     :param work_content: 工单内容（work_content）
     :param report_content: 上报内容（report_content），可选
-    :return: 热度值（count），如果找不到则返回0
+    :param severity_level: 严重程度（用于基础热度加成），可选
+    :return: 热度值（整数），如果找不到则返回0
     """
     try:
         # 确保热度分析器已初始化
@@ -54,34 +55,79 @@ def get_work_order_priority(work_content: str, report_content: str = None) -> in
         if not content_to_match or not content_to_match.strip():
             return 0
         
+        # 尝试在没有传入 severity_level 时从数据库中推断严重程度
+        if not severity_level:
+            try:
+                db_infer = next(get_db())
+                try:
+                    # 先尝试用工单内容精确匹配
+                    work_match = db_infer.query(WorkOrderNumberTable).filter(WorkOrderNumberTable.work_content == work_content).first()
+                    if work_match and work_match.severityLevel:
+                        severity_level = work_match.severityLevel
+                    else:
+                        # 尝试通过上报表映射到工单查找严重程度
+                        ur = db_infer.query(UserReportTable).filter(UserReportTable.report_content == content_to_match).first()
+                        if ur and ur.report_id:
+                            wo2 = db_infer.query(WorkOrderNumberTable).filter(WorkOrderNumberTable.work_order_number == ur.report_id).first()
+                            if wo2 and wo2.severityLevel:
+                                severity_level = wo2.severityLevel
+                finally:
+                    db_infer.close()
+            except Exception:
+                pass
+
         # 方法1：使用 find_similar_reports 查找最相似的报告（更准确）
         similar_reports = hotspot_ranker.find_similar_reports(content_to_match.strip(), top_k=1)
+        clusters = hotspot_ranker.get_clusters()
         if similar_reports and len(similar_reports) > 0:
-            # 找到了相似报告，获取其所属聚类的count
+            # 找到了相似报告，获取其所属聚类的ID
             similar_report_text = similar_reports[0][0]
-            clusters = hotspot_ranker.get_clusters()
-            
-            # 查找该报告所属的聚类
             for cluster_id, cluster_info in clusters.items():
                 cluster_reports = cluster_info.get('reports', [])
                 if similar_report_text in cluster_reports:
-                    return cluster_info.get('count', 0)
+                    heat_score = hotspot_ranker.compute_heat_for_cluster(int(cluster_id))
+                    base_heat = 0
+                    if severity_level:
+                        level = str(severity_level)
+                        if '紧急' in level or level.lower() == 'urgent' or 'urgent' in level.lower():
+                            base_heat = 10
+                        elif '快速' in level or level.lower() == 'quick' or 'quick' in level.lower():
+                            base_heat = 5
+                    final = max(0.0, base_heat + heat_score)
+                    return int(round(final))
         
         # 方法2：直接遍历聚类进行匹配（备用方法）
-        clusters = hotspot_ranker.get_clusters()
         for cluster_id, cluster_info in clusters.items():
             cluster_reports = cluster_info.get('reports', [])
             
             # 精确匹配
             if content_to_match.strip() in cluster_reports:
-                return cluster_info.get('count', 0)
+                heat_score = hotspot_ranker.compute_heat_for_cluster(int(cluster_id))
+                base_heat = 0
+                if severity_level:
+                    level = str(severity_level)
+                    if '紧急' in level or level.lower() == 'urgent' or 'urgent' in level.lower():
+                        base_heat = 10
+                    elif '快速' in level or level.lower() == 'quick' or 'quick' in level.lower():
+                        base_heat = 5
+                final = max(0.0, base_heat + heat_score)
+                return int(round(final))
             
             # 模糊匹配（检查内容是否相似）
             for report in cluster_reports:
                 if report and content_to_match:
                     # 如果内容相似（包含关系），返回该聚类的count
                     if content_to_match.strip() in report or report in content_to_match.strip():
-                        return cluster_info.get('count', 0)
+                        heat_score = hotspot_ranker.compute_heat_for_cluster(int(cluster_id))
+                        base_heat = 0
+                        if severity_level:
+                            level = str(severity_level)
+                            if '紧急' in level or level.lower() == 'urgent' or 'urgent' in level.lower():
+                                base_heat = 10
+                            elif '快速' in level or level.lower() == 'quick' or 'quick' in level.lower():
+                                base_heat = 5
+                        final = max(0.0, base_heat + heat_score)
+                        return int(round(final))
         
         # 如果找不到匹配的聚类，返回0
         return 0
@@ -207,8 +253,8 @@ async def submit_issue(user_content: str = Form(...), db=Depends(get_db)):
         # 通过WebSocket广播（包含最新热度排行榜）
         ranking = hotspot_ranker.get_hotspot_ranking(top_k=10)
         notification["hotspot_ranking"] = [
-            {"issue": str(issue), "count": int(count), "cluster_id": str(cluster_id)}
-            for issue, count, cluster_id in ranking
+            {"issue": str(issue), "heat": float(heat), "count": int(count), "cluster_id": str(cluster_id)}
+            for issue, heat, count, cluster_id in ranking
         ]
 
         await broadcast_notification(notification)
@@ -510,70 +556,109 @@ async def get_hotspot_ranking(top_k: int = 10, refresh: bool = True):
 
             # 获取聚类信息，用于匹配
             clusters = hotspot_ranker.get_clusters()
-        finally:
-            db_session.close()
 
-        # 构建返回结果，包含severityLevel
-        ranking_result = []
-        for idx, (issue, count, cluster_id) in enumerate(ranking):
-            # 尝试从映射中获取severityLevel
-            severity_level = None
+            # 构建返回结果，包含severityLevel和原始诉求
+            ranking_result = []
+            for idx, (issue, heat_score, report_count, cluster_id) in enumerate(ranking):
+                # 尝试从映射中获取severityLevel
+                severity_level = None
 
-            # 方法1：精确匹配（优先使用user_content映射，因为热度分析器使用的是user_content）
-            if issue in user_content_to_severity:
-                severity_level = user_content_to_severity[issue]
-            elif issue in work_content_to_severity:
-                severity_level = work_content_to_severity[issue]
-            else:
-                # 方法2：通过聚类中的报告匹配（聚类中的报告是user_content）
-                if str(cluster_id) in clusters:
-                    cluster_reports = clusters[str(cluster_id)].get('reports', [])
-                    # 对于聚类中的每个报告（user_content），尝试匹配工单
-                    for report in cluster_reports:
-                        # 优先使用user_content映射（精确匹配）
-                        if report in user_content_to_severity:
-                            severity_level = user_content_to_severity[report]
-                            break
-                        # 其次使用work_content映射（精确匹配）
-                        elif report in work_content_to_severity:
-                            severity_level = work_content_to_severity[report]
-                            break
-                        # 模糊匹配：检查工单内容是否包含报告，或报告是否包含工单内容
-                        for content, level in user_content_to_severity.items():
-                            if len(report) > 0 and len(content) > 0:
-                                if report in content or content in report:
-                                    severity_level = level
-                                    break
-                        if not severity_level:
-                            for content, level in work_content_to_severity.items():
+                # 方法1：精确匹配（优先使用user_content映射，因为热度分析器使用的是user_content）
+                if issue in user_content_to_severity:
+                    severity_level = user_content_to_severity[issue]
+                elif issue in work_content_to_severity:
+                    severity_level = work_content_to_severity[issue]
+                else:
+                    # 方法2：通过聚类中的报告匹配（聚类中的报告是user_content）
+                    if str(cluster_id) in clusters:
+                        cluster_reports = clusters[str(cluster_id)].get('reports', [])
+                        # 对于聚类中的每个报告（user_content），尝试匹配工单
+                        for report in cluster_reports:
+                            # 优先使用user_content映射（精确匹配）
+                            if report in user_content_to_severity:
+                                severity_level = user_content_to_severity[report]
+                                break
+                            # 其次使用work_content映射（精确匹配）
+                            elif report in work_content_to_severity:
+                                severity_level = work_content_to_severity[report]
+                                break
+                            # 模糊匹配：检查工单内容是否包含报告，或报告是否包含工单内容
+                            for content, level in user_content_to_severity.items():
                                 if len(report) > 0 and len(content) > 0:
                                     if report in content or content in report:
                                         severity_level = level
                                         break
-                        if severity_level:
-                            break
+                            if not severity_level:
+                                for content, level in work_content_to_severity.items():
+                                    if len(report) > 0 and len(content) > 0:
+                                        if report in content or content in report:
+                                            severity_level = level
+                                            break
+                            if severity_level:
+                                break
 
-                # 方法3：模糊匹配问题文本
-                if not severity_level:
-                    # 优先使用user_content映射
-                    for content, level in user_content_to_severity.items():
-                        if issue in content or content in issue:
-                            severity_level = level
-                            break
-                    # 其次使用work_content映射
+                    # 方法3：模糊匹配问题文本
                     if not severity_level:
-                        for content, level in work_content_to_severity.items():
+                        # 优先使用user_content映射
+                        for content, level in user_content_to_severity.items():
                             if issue in content or content in issue:
                                 severity_level = level
                                 break
+                        # 其次使用work_content映射
+                        if not severity_level:
+                            for content, level in work_content_to_severity.items():
+                                if issue in content or content in issue:
+                                    severity_level = level
+                                    break
 
-            ranking_result.append({
-                "rank": idx + 1,
-                "issue": issue,
-                "count": count,
-                "cluster_id": cluster_id,
-                "severityLevel": severity_level  # 添加severityLevel字段
-            })
+                # 根据severityLevel计算基础热度
+                base_heat = 0
+                if severity_level:
+                    level = str(severity_level)
+                    if '紧急' in level or level.lower() == 'urgent' or 'urgent' in level.lower():
+                        base_heat = 10
+                    elif '快速' in level or level.lower() == 'quick' or 'quick' in level.lower():
+                        base_heat = 5
+
+                # 最终热度 = 基础热度 + 上报计算出的heat_score
+                final_heat = max(0.0, base_heat + (heat_score or 0.0))
+
+                # 获取原始诉求：通过聚类中的报告找到对应的工单ID，然后通过工单ID获取原始诉求
+                original_content = ""
+                if str(cluster_id) in clusters:
+                    cluster_reports = clusters[str(cluster_id)].get('reports', [])
+                    # 尝试从聚类中的报告找到对应的工单
+                    for report_text in cluster_reports:
+                        if report_text:
+                            # 聚类中的报告是work_content，通过work_content找到对应的工单
+                            work_order = db_session.query(WorkOrderNumberTable).filter(
+                                WorkOrderNumberTable.work_content.isnot(None),
+                                (
+                                    WorkOrderNumberTable.work_content == report_text
+                                ) | (
+                                    WorkOrderNumberTable.work_content.contains(report_text[:100] if len(report_text) > 100 else report_text)
+                                )
+                            ).first()
+                            
+                            if work_order and work_order.work_order_number:
+                                # 通过工单ID调用_extract_original_content方法获取原始诉求
+                                original_content = _extract_original_content(work_order.work_order_number, db_session)
+                                if original_content:
+                                    break  # 找到第一个就退出
+                
+                # 将最终热度作为count返回（前端兼容使用）并保留原始上报次数report_count
+                ranking_result.append({
+                    "rank": idx + 1,
+                    "issue": issue,
+                    "count": int(round(final_heat)),
+                    "heat": round(final_heat, 2),
+                    "report_count": report_count,
+                    "cluster_id": cluster_id,
+                    "severityLevel": severity_level,  # 添加severityLevel字段
+                    "original_content": original_content  # 添加原始诉求字段
+                })
+        finally:
+            db_session.close()
 
         return {
             "ranking": ranking_result,
@@ -849,7 +934,7 @@ async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None
             hotspot_ranker.reload_from_database(db_session)
             
             # 获取上报内容（report_content）用于匹配热度
-            from model.db import UserReportTable
+
             report_content = None
             user_report = db_session.query(UserReportTable).filter(
                 UserReportTable.report_id == work_order_number
@@ -860,7 +945,8 @@ async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None
             # 获取当前热度值并保存
             hotspot_priority = get_work_order_priority(
                 work_order_entry.work_content or "", 
-                report_content
+                report_content,
+                severity_level=work_order_entry.severityLevel
             )
             work_order_entry.hotspot_priority = hotspot_priority
             print(f"保存工单 {work_order_number} 的热度值: {hotspot_priority}")
@@ -869,7 +955,7 @@ async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None
             import traceback
             traceback.print_exc()
         
-        db_session.commit()
+        # db_session.commit()
     solution_data = WorkPlanTable(
         work_form_id=work_order_number,
         work_plan_content=ai_reply
@@ -881,57 +967,61 @@ async def get_solution_save_db(ai_reply: str, work_order_number: str = Form(None
 
 
 @app.post("/get-solution/")
-async def get_solution(work_order_content: str = Form(None), work_order_number: str = Form(None)):
+def get_solution(work_order_content: str = Form(None), work_order_number: str = Form(None)):
     """
     获取解决方案
     :param work_order_content: 工单内容（可选，如果不提供则使用pa_token_manager.user_question）
     :param work_order_number: 工单编号（可选，用于更新该工单处理状态与关联处置方案）
     :return: ai回复
     """
+
     try:
         # 优先使用传入的工单内容，否则使用pa_token_manager中的user_question
         user_content = work_order_content or pa_token_manager.user_question or ""
 
         if not user_content:
             return JSONResponse({"error": "工单内容不能为空"}, status_code=400)
-        # weather_info = await get_weather()
-        # holiday_info = await get_holiday()
-
+        # print(user_content)
         url = "/basic/openapi/engine/chat/v1/completions"
+        from utils.extract_info import extract_work_order_info
+        info = extract_work_order_info(user_content.replace("\r\n", ","))
         data = {
             "chatId": "1414934653136449537",
             "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
             "messages": [
                 {
-                    "content": "生成处置流程和处理方案." + user_content,
+                    "content": "生成处置流程和处理方案." + f"事件摘要: {info['event_summary']}" + f"影响范围: {info['impact_range']}" +f"地点: {info['location']}",
                     # "content": "生成处置流程和处理方案." + user_content + f"当地天气信息：{weather_info.get('now', {})},当天是否为节假日:{holiday_info}",
                     "role": "user"
                 }
             ]
         }
-
-        header = {
-            'Content-Type': 'application/json',
-            'token': await get_token(),
-        }
-        connect = aiohttp.TCPConnector(ssl=CONTENT)
-        async with ClientSession(connector=connect, timeout=ClientTimeout(180)) as session:
-            async with session.post(os.getenv('PA_BASE_URL') + url, data=json.dumps(data).encode('utf-8'),headers=header) as resp:
-                if resp.status == 200:
-                    res_json = await resp.json()
-                    ai_reply = res_json['choices'][0]['message']['content']
-
-                    ai_reply_json = get_json_string(ai_reply)
-                    await get_solution_save_db(ai_reply, work_order_number)
-                    return ai_reply_json
-                else:
-                    res_json = await resp.text(encoding="utf-8")
-                    print('error', res_json)
+        print('data', data)
+        # header = {
+        #     'Content-Type': 'application/json',
+        #     'token': pa_token_manager.token
+        # }
+        # connect = aiohttp.TCPConnector(ssl=CONTENT)
+        # async with ClientSession(connector=connect, timeout=ClientTimeout(180)) as session:
+        #     async with session.post(os.getenv('PA_BASE_URL') + url, data=json.dumps(data).encode('utf-8'),headers=header) as resp:
+        #         if resp.status == 200:
+        #             res_json = await resp.json()
+        #             ai_reply = res_json['choices'][0]['message']['content']
+        #             ai_reply_json = get_json_string(ai_reply)
+        #             await get_solution_save_db(ai_reply, work_order_number)
+        #             return ai_reply_json
+        #         else:
+        #             res_json = await resp.text(encoding="utf-8")
+        #             print('error', res_json)
+        from .demo import get_complents
+        ai_reply_json = asyncio.run(get_complents(data))
+        asyncio.run(get_solution_save_db(ai_reply_json, work_order_number))
+        return get_json_string(ai_reply_json)
     except Exception as e:
         print(f"Error in get_solution: {e}")
-        import traceback
-        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
 
 
 
@@ -946,13 +1036,43 @@ async def get_judge(process_result: str, process_content: str, public_visit: str
     :param work_order_number: 工单编号
     :return:
     """
-    form_info = pa_token_manager.form_info or None
+    print(process_result, process_content, public_visit, work_order_number)
+    db = next(get_db())
+    info = db.query(WorkOrderNumberTable).filter(WorkOrderNumberTable.work_order_number == work_order_number).first()
+    if info:
+        try:
+            # 使用 from_attributes=True 从 SQLAlchemy 对象创建 Pydantic 模型
+            # 处理 report_time 从 DateTime 转换为字符串
+            work_order_dict = {
+                "report_time": info.report_time.strftime("%Y-%m-%d %H:%M:%S") if info.report_time else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "work_order_number": info.work_order_number or "",
+                "severityLevel": info.severityLevel or "",
+                "ticketType": info.ticketType or "",
+                "ticketCategory": info.ticketCategory or "",
+                "collaborationType": info.collaborationType or "",
+                "responsibleUnit": info.responsibleUnit or "",
+                "assistingUnit": info.assistingUnit or "",
+                "location": info.location or "",
+                "channel": info.channel or "",
+                "contact": info.contact or "",
+                "impactRange": info.impactRange or "",
+                "work_content": info.work_content or "",
+                "work_status": info.work_status or "未处理",
+                "work_form_score": info.work_form_score or 0.0,
+                "user_phone": info.user_phone or ""
+            }
+            form_info = WorkOrderNumber.model_validate(work_order_dict).model_dump_json()
+        except Exception as e:
+            print(f"Error converting work order info: {e}")
+            form_info = ""
+    else:
+        form_info = ""
     data = {
         "chatId": "1414934653136449537",
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
-                "content": "工单评价." + public_visit + f'工单信息：{form_info}。+ 返回的json数据，键用英文表示，值用中文表示',
+                "content": "工单评价:" + f'用户反馈:{public_visit}'+f'处置结果:{process_result}' + f" 处置过程:{process_content}"+ f'工单信息：{form_info}。+ 返回的json数据，键用英文表示，值用中文表示',
                 "role": "user"
             }
         ]
@@ -1317,17 +1437,39 @@ async def get_work_order_detail(
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/get-original-content/")
-async def get_original_content(work_order_id: str, db: Session = Depends(get_db)):
+def _extract_original_content(work_order_id: str, db: Session) -> str:
+    """
+    从工单ID提取原始诉求内容的辅助函数
+    :param work_order_id: 工单ID
+    :param db: 数据库会话
+    :return: 原始诉求内容
+    """
     try:
         work_order_info = db.query(UserReportTable).filter(
             UserReportTable.report_id == work_order_id
         ).first()
+        
+        if not work_order_info or not work_order_info.report_content:
+            return ""
+        
+        # 尝试从报告内容中提取"问题:"后面的内容
         match = re.search(r"问题[:：]\s*(.*)", work_order_info.report_content)
         if match:
-            return {"original_content": match.group(1).strip()}
+            return match.group(1).strip()
         else:
-            return {"original_content": ""}
+            # 如果没有匹配到"问题:"格式，直接返回整个报告内容
+            return work_order_info.report_content.strip()
+    except Exception as e:
+        print(f"Error in _extract_original_content: {e}")
+        return ""
+
+
+@app.get("/get-original-content/")
+async def get_original_content(work_order_id: str, db: Session = Depends(get_db)):
+    try:
+        original_content = _extract_original_content(work_order_id, db)
+        return {"original_content": original_content}
     except Exception as e:
         print(f"Error in get_original_content: {e}")
         traceback.print_exc()
+        return JSONResponse({"error": str(e), "original_content": ""}, status_code=500)

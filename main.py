@@ -10,11 +10,9 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 from model.db import Base, get_db, Engine
 from utils.hot_spot import MunicipalHotspotRanker
-from utils.save_pa_token import PaTokenManager
+from utils.shared import pa_token_manager
 from routers import mobile, web
 from fastapi.responses import HTMLResponse
-
-pa_token_manager = PaTokenManager()
 Base.metadata.create_all(Engine)
 load_dotenv()
 hotspot_ranker = None
@@ -35,8 +33,7 @@ async def lifespan(application: FastAPI):
         redis_client = redis.from_url(REDIS_URL)
 
         # 获取初始token
-        a = await pa_token_manager.refresh_token()
-        print(a)
+        pa_token_manager.token = await pa_token_manager.refresh_token()
         print("Initial token fetched successfully")
 
         # 初始化热度分析器并从数据库加载数据

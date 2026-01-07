@@ -62,7 +62,7 @@ async def async_main():
                 return res_json['data']['token']
             return None
 
-async def get_complents():
+async def get_complents(user_input):
     token = await async_main()
     url = "/basic/openapi/engine/chat/v1/completions"
     data = {
@@ -70,7 +70,7 @@ async def get_complents():
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
-                "content": "生成处置流程和处理方案." + 'xxxx',
+                "content": "生成处置流程和处理方案." + f'{user_input}',
                 "role": "user"
             }
         ]
@@ -95,5 +95,5 @@ async def get_complents():
 if __name__ == '__main__':
     import asyncio
 
-    asyncio.run(get_complents())
+    asyncio.run(get_complents(''))
     # asyncio.run(main())

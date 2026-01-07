@@ -3,6 +3,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import jieba
 from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+from datetime import datetime, timedelta
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -20,7 +21,9 @@ class MunicipalHotspotRanker:
         :param similarity_threshold: 相似度阈值（0-1之间），值越大要求越相似
         :param db_session: 数据库会话，如果提供则从数据库加载历史数据
         """
-        self.reports = []  # 存储所有上报的问题
+        # 为了支持基于时间的热度计算，使用并行列表存储文本与时间
+        self.report_texts: List[str] = []  # 报告文本，用于向量化
+        self.report_times: List[datetime] = []  # 对应的时间戳
         self.report_cluster_map = {}  # 报告索引到聚类ID的映射
         self.clusters = {}  # 聚类信息 {cluster_id: {'representative': 代表文本, 'count': 数量, 'reports': [索引列表]}}
         self.cluster_counter = 0  # 聚类ID计数器
@@ -43,18 +46,23 @@ class MunicipalHotspotRanker:
         if db_session is not None:
             self.load_from_database(db_session)
 
-    def add_report(self, text: str) -> int:
+    def add_report(self, text: str, report_time: Optional[datetime] = None) -> int:
         """
         添加一条新的市政问题上报记录，并自动进行相似度匹配和聚类
         :param text: 用户上报的问题文本
+        :param report_time: 报告时间（默认现在）
         :return: 新报告的索引
         """
         if not text or not text.strip():
             raise ValueError("问题文本不能为空")
         
         text = text.strip()
-        report_idx = len(self.reports)
-        self.reports.append(text)
+        if report_time is None:
+            report_time = datetime.now()
+        
+        report_idx = len(self.report_texts)
+        self.report_texts.append(text)
+        self.report_times.append(report_time)
         
         # 如果这是第一条报告，直接创建新聚类
         if report_idx == 0:
@@ -93,6 +101,57 @@ class MunicipalHotspotRanker:
         }
         return cluster_id
 
+    def compute_heat_for_cluster(self, cluster_id: int, now: Optional[datetime] = None) -> float:
+        """
+        根据规则计算指定聚类的热度值
+        规则：
+          基础热度：紧急类10，快速处理5，常规0（通过severityLevel传入或在外部映射）
+          上报次数得分：每一次独立上报 +2
+          集中上报加成：1小时内上报次数>3，每多一次上报 +1
+          时间衰减：每小时 -0.1，但最低不低于0
+        :param cluster_id: 聚类ID
+        :param now: 计算参考时间（默认现在）
+        :return: 计算后的热度（浮点数，底线为0）
+        """
+        if now is None:
+            now = datetime.now()
+        if cluster_id not in self.clusters:
+            return 0.0
+        cluster = self.clusters[cluster_id]
+        report_indices = cluster.get('reports', [])
+
+        # 上报次数得分
+        report_count = len(report_indices)
+        report_score = report_count * 2.0
+
+        # 计算集中上报（过去1小时内上报次数）
+        one_hour_ago = now - timedelta(hours=1)
+        recent_count = 0
+        for idx in report_indices:
+            if idx < len(self.report_times) and self.report_times[idx] >= one_hour_ago:
+                recent_count += 1
+        concentrated_bonus = 0.0
+        if recent_count > 3:
+            concentrated_bonus = float(recent_count - 3) * 1.0
+
+        # 时间衰减：取最早报告时间到现在的小时差作为总时差
+        # 也可以使用聚类第一个报告时间或平均时间，这里使用最早时间
+        earliest_time = None
+        for idx in report_indices:
+            if idx < len(self.report_times):
+                t = self.report_times[idx]
+                if earliest_time is None or t < earliest_time:
+                    earliest_time = t
+        if earliest_time is None:
+            hours_diff = 0
+        else:
+            hours_diff = max(0, (now - earliest_time).total_seconds() / 3600.0)
+        time_decay = hours_diff * 0.1
+
+        # 基础热度项保留为外部传入（由路由端整合severityLevel），因此这里只返回附加值
+        # 最终热度计算由外部汇总：基础热度 + report_score + concentrated_bonus - time_decay
+        heat = max(0.0, report_score + concentrated_bonus - time_decay)
+        return heat
     def _add_to_cluster(self, report_idx: int, cluster_id: int):
         """将报告添加到指定聚类"""
         self.report_cluster_map[report_idx] = cluster_id
@@ -142,8 +201,8 @@ class MunicipalHotspotRanker:
 
     def _rebuild_vectorizer(self):
         """重新构建向量化器（当添加新文本导致vocabulary变化时）"""
-        if len(self.reports) > 0:
-            self.tfidf_matrix = self.vectorizer.fit_transform(self.reports)
+        if len(self.report_texts) > 0:
+            self.tfidf_matrix = self.vectorizer.fit_transform(self.report_texts)
 
     def find_similar_reports(self, text: str, top_k: int = 5) -> List[Tuple[str, float]]:
         """
@@ -152,7 +211,7 @@ class MunicipalHotspotRanker:
         :param top_k: 返回最相似的前k个
         :return: [(相似报告, 相似度), ...]，按相似度降序排列
         """
-        if not self.reports or self.tfidf_matrix is None:
+        if not self.report_texts or self.tfidf_matrix is None:
             return []
         
         # 向量化查询文本
@@ -163,7 +222,7 @@ class MunicipalHotspotRanker:
         
         # 获取top_k个最相似的结果
         top_indices = np.argsort(similarities)[::-1][:top_k]
-        results = [(self.reports[i], similarities[i]) for i in top_indices if similarities[i] >= self.similarity_threshold]
+        results = [(self.report_texts[i], similarities[i]) for i in top_indices if similarities[i] >= self.similarity_threshold]
         
         return results
 
@@ -177,33 +236,32 @@ class MunicipalHotspotRanker:
             result[str(cluster_id)] = {
                 'representative': cluster_info['representative'],
                 'count': cluster_info['count'],
-                'reports': [self.reports[idx] for idx in cluster_info['reports']]
+                'reports': [self.report_texts[idx] for idx in cluster_info['reports']]
             }
         return result
 
-    def get_hotspot_ranking(self, top_k: int = 10) -> List[Tuple[str, int, int]]:
+    def get_hotspot_ranking(self, top_k: int = 10, now: Optional[datetime] = None) -> List[Tuple[str, float, int, int]]:
         """
-        获取热度排行榜（按数量降序）
+        获取热度排行榜（按计算后的热度降序）
         :param top_k: 返回前多少条
-        :return: [(代表问题文本, 数量, 聚类ID), ...]
+        :param now: 计算热度的参考时间，默认现在
+        :return: [(代表问题文本, 计算热度, 上报次数, 聚类ID), ...]
         """
+        if now is None:
+            now = datetime.now()
         if not self.clusters:
             return []
-        
-        # 按数量排序
-        ranked = sorted(
-            self.clusters.items(),
-            key=lambda x: x[1]['count'],
-            reverse=True
-        )
-        
+        # 计算每个聚类的热度
+        ranked = []
+        for cluster_id, cluster_info in self.clusters.items():
+            heat = self.compute_heat_for_cluster(cluster_id, now=now)
+            count = cluster_info.get('count', 0)
+            ranked.append((cluster_info['representative'], heat, count, cluster_id))
+
+        ranked_sorted = sorted(ranked, key=lambda x: x[1], reverse=True)
         # 返回前top_k个
-        result = [
-            (cluster_info['representative'], cluster_info['count'], cluster_id)
-            for cluster_id, cluster_info in ranked[:top_k]
-        ]
-        
-        return result
+        return ranked_sorted[:top_k]
+
 
     def print_hotspot(self, top_k: int = 10) -> None:
         """
@@ -217,7 +275,7 @@ class MunicipalHotspotRanker:
         
         print("\n🔥 市政设施问题热度排行榜 🔥")
         print("=" * 60)
-        for idx, (issue, count, cluster_id) in enumerate(ranking, start=1):
+        for idx, (issue, heat, count, cluster_id) in enumerate(ranking, start=1):
             # 添加热度标签
             if idx == 1:
                 tag = "🔥"
@@ -226,7 +284,7 @@ class MunicipalHotspotRanker:
             else:
                 tag = "  "
             print(f"{tag} {idx}. {issue}")
-            print(f"   热度: {count} | 聚类ID: {cluster_id}")
+            print(f"   热度: {heat:.2f} | 上报次数: {count} | 聚类ID: {cluster_id}")
         
         print("=" * 60)
 
@@ -239,7 +297,7 @@ class MunicipalHotspotRanker:
         if cluster_id not in self.clusters:
             return []
         
-        return [self.reports[idx] for idx in self.clusters[cluster_id]['reports']]
+        return [self.report_texts[idx] for idx in self.clusters[cluster_id]['reports']]
 
     def get_statistics(self) -> Dict:
         """
@@ -247,9 +305,9 @@ class MunicipalHotspotRanker:
         :return: 统计信息字典
         """
         return {
-            'total_reports': len(self.reports),
+            'total_reports': len(self.report_texts),
             'total_clusters': len(self.clusters),
-            'avg_reports_per_cluster': len(self.reports) / len(self.clusters) if self.clusters else 0
+            'avg_reports_per_cluster': len(self.report_texts) / len(self.clusters) if self.clusters else 0
         }
 
     def load_from_database(self, db_session: 'Session'):
@@ -273,7 +331,8 @@ class MunicipalHotspotRanker:
             ).order_by(WorkOrderNumberTable.report_time.desc()).all()
             
             # 无论是否有数据，都先清空现有数据
-            self.reports = []
+            self.report_texts = []
+            self.report_times = []
             self.report_cluster_map = {}
             self.clusters = {}
             self.cluster_counter = 0
@@ -287,66 +346,28 @@ class MunicipalHotspotRanker:
             print(f"正在从数据库加载 {len(user_reports)} 条历史报告...")
             for report in user_reports:
                 if report.work_content and report.work_content.strip():
-                    # 使用add_report方法添加，会自动进行聚类
-                    self.add_report(report.work_content.strip())
+                    # 尝试解析 report.report_time 为 datetime
+                    rt = report.report_time
+                    if isinstance(rt, str):
+                        try:
+                            parsed = datetime.fromisoformat(rt.replace('Z', '+00:00'))
+                        except:
+                            parsed = datetime.now()
+                    elif isinstance(rt, datetime):
+                        parsed = rt
+                    else:
+                        parsed = datetime.now()
+
+                    # 使用add_report方法添加，会自动进行聚类，并保存时间
+                    self.add_report(report.work_content.strip(), report_time=parsed)
             
-            print(f"成功加载 {len(self.reports)} 条报告，形成 {len(self.clusters)} 个聚类")
-            
+            print(f"成功加载 {len(self.report_texts)} 条报告，形成 {len(self.clusters)} 个聚类")
         except Exception as e:
-            print(f"从数据库加载数据失败: {e}")
-            import traceback
-            traceback.print_exc()
-    
+            print(e)
+
     def reload_from_database(self, db_session: 'Session'):
         """
         重新从数据库加载数据（用于刷新）
         :param db_session: 数据库会话
         """
         self.load_from_database(db_session)
-
-
-# 示例使用
-if __name__ == "__main__":
-    # 创建热度分析器，设置相似度阈值为0.6
-    ranker = MunicipalHotspotRanker(similarity_threshold=0.6)
-
-    # 模拟用户随时上报的市政基础设施问题
-    reports = [
-        "水管爆裂严重，需要马上处理",
-        "水管爆裂,导致大面积停水,请尽快处理",
-        "自来水管道漏水，影响居民用水",
-        "燃气泄漏风险，需要马上去处理",
-        "燃气管道有异味，疑似泄漏",
-        "下水道堵塞，污水外溢",
-        "污水井盖破损，存在安全隐患",
-        "供水主管道爆裂，导致大面积停水",
-        "燃气报警器响起，怀疑泄漏",
-        "路灯不亮，影响夜间出行安全",
-        "道路照明灯故障，需要维修",
-        "交通信号灯不工作，影响交通",
-        "垃圾桶满了，需要清理",
-        "垃圾箱溢出，异味严重",
-    ]
-
-    print("正在处理上报的问题...")
-    for i, r in enumerate(reports, 1):
-        ranker.add_report(r)
-        print(f"已处理第 {i} 条上报")
-
-    # 打印热度排行
-    ranker.print_hotspot()
-
-    # 打印统计信息
-    print("\n📊 统计信息")
-    stats = ranker.get_statistics()
-    print(f"总上报数: {stats['total_reports']}")
-    print(f"聚类数量: {stats['total_clusters']}")
-    print(f"平均每类问题数: {stats['avg_reports_per_cluster']:.2f}")
-
-    # 查看相似问题示例
-    print("\n🔍 查找相似问题示例:")
-    query = "水管爆裂"
-    similar = ranker.find_similar_reports(query, top_k=3)
-    print(f"查询: '{query}'")
-    for report, similarity in similar:
-        print(f"  - {report} (相似度: {similarity:.2f})")
