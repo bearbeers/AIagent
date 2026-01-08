@@ -16,5 +16,6 @@ dependencies = [
     "snowflake-id>=1.0.2",
     "sqlalchemy>=2.0.45",
     "uvicorn>=0.38.0",
+    "websocket-client>=1.9.0",
     "websockets>=15.0.1",
 ]

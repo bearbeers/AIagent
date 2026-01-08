@@ -766,7 +766,7 @@ async def gen_form(user_content: str = None, db: Session = None):
         ]
     }
 
-    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await get_token())
+    res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=pa_token_manager.token)
     ai_reply = res_json['choices'][0]['message']['content']
 
     # 解析AI回复，获取工单数据
@@ -1072,7 +1072,7 @@ async def get_judge(process_result: str, process_content: str, public_visit: str
         "appId": "a4f80bb2f25b4f65bd8a0fbaa813d0c9",
         "messages": [
             {
-                "content": "工单评价:" + f'用户反馈:{public_visit}'+f'处置结果:{process_result}' + f" 处置过程:{process_content}"+ f'工单信息：{form_info}。+ 返回的json数据，键用英文表示，值用中文表示',
+                "content": "工单评价:" + f'用户反馈:{public_visit}'+f'处置结果:{process_result}' + f" 处置过程:{process_content}"+ f'工单信息：{form_info}',
                 "role": "user"
             }
         ]
@@ -1080,6 +1080,7 @@ async def get_judge(process_result: str, process_content: str, public_visit: str
     url = "/basic/openapi/engine/chat/v1/completions"
     res_json = await request_pa(os.getenv('PA_BASE_URL') + url, data, token=await pa_token_manager.get_token())
     ai_reply = res_json['choices'][0]['message']['content']
+    print(ai_reply)
     json_string = get_json_string(ai_reply)
 
     # 获取工单内容并更新工单状态为"已处理"
